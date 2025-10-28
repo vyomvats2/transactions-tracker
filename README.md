@@ -7,7 +7,7 @@ The core philosophy is to prioritize data integrity and richness over a polished
 ## Core Architecture
 
 *   **Parser-based System:** The application uses a flexible, parser-based architecture. Instead of a single parsing function, it features a registry of specialized parser classes, each designed to handle the unique format of a specific financial statement.
-*   **Rich Data Model:** The database schema is designed to capture deep details, including distinctions between transaction and settlement currencies for foreign purchases.
+*   **Rich Data Model:** The database schema is designed to capture deep details, including distinctions between transaction and settlement currencies for foreign purchases, exchange rates, and transaction vs. posted dates.
 *   **Local-First & Dockerized:** The entire application is containerized using Docker, ensuring a consistent and isolated environment that is easy to set up and run locally.
 
 ## Technology Stack
@@ -62,3 +62,22 @@ The application is now running! You can access the Django admin interface to vie
 
 *   **URL:** `http://localhost:8000/admin`
 *   **Login:** Use the superuser credentials you created in the previous step.
+
+### 5. Parsing a Statement
+
+To parse a statement, you must place the file in a location accessible to the Docker container. The project root is mounted as `/code/` inside the container. A good practice is to create a `statements/` directory in the project root to hold your files.
+
+Then, run the `parse_statement` management command, specifying which parser to use and the path to the file.
+
+```bash
+# Example: Create a directory for your statements
+mkdir statements
+
+# Copy your PDF into the new directory
+cp /path/to/your/bank-statement.pdf statements/
+
+# Run the parser from your host machine
+docker compose -f compose/docker-compose.yml exec web python manage.py parse_statement --parser simple_pdf /code/statements/bank-statement.pdf
+```
+
+The command will use the `simple_pdf` parser to process the file and save the transactions to the database. You can then view the imported data in the Django admin.
