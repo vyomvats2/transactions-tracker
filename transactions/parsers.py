@@ -21,6 +21,17 @@ class StatementParser(abc.ABC):
         """
         raise NotImplementedError
 
+def get_parser_choices():
+    """Dynamically finds all available parser classes."""
+    # This function looks for all classes that inherit from StatementParser
+    # and returns a list of their unique `parser_name` attributes.
+    return [
+        subclass.parser_name
+        for subclass in StatementParser.__subclasses__()
+        if hasattr(subclass, 'parser_name') and subclass.parser_name
+    ]
+
+
 
 class SimplePDFParser(StatementParser):
     """A basic parser for simple, single-line transaction tables in PDFs."""
