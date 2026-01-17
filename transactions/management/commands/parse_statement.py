@@ -33,7 +33,7 @@ class Command(BaseCommand):
 
             self.stdout.write(self.style.NOTICE(f"Starting parsing for '{pdf_path}' using '{parser_name}' parser."))
             try:
-                parser_instance = parser_class(statement_path=pdf_path)
+                parser_instance = parser_class(statement_path=pdf_path, stdout=self.stdout, style=self.style)
                 parser_instance.parse()
                 self.stdout.write(self.style.SUCCESS(f'Successfully parsed and saved transactions from: {pdf_path}'))
             except Exception as e:

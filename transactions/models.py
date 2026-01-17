@@ -21,6 +21,6 @@ class Transaction(models.Model):
     # The exchange rate applied, if it was a foreign transaction.
     exchange_rate = models.DecimalField(max_digits=18, decimal_places=8, null=True, blank=True)
 
-    hash_dedupe = models.CharField(max_length=64, unique=True)
+    hash_dedupe = models.CharField(max_length=128, unique=True)
     source_file = models.CharField(max_length=1024, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
