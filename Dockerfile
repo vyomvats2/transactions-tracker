@@ -6,6 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /code
 
+# Install system dependencies, including postgresql-client for `dbshell`
+RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
 COPY requirements.txt /code/
 RUN pip install --no-cache-dir -r requirements.txt
