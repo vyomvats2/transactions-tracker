@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#
+# fc — finch compose wrapper for this project.
+#
+# Runs `finch compose` against compose/docker-compose.yml with the
+# project-root .env file loaded for variable interpolation. Resolves
+# the repo root from the script's own location so the wrapper works
+# regardless of the caller's current directory.
+#
+# Usage:
+#   ./scripts/fc up --build -d
+#   ./scripts/fc exec web python manage.py migrate
+#   ./scripts/fc logs -f web
+#   ./scripts/fc down
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+COMPOSE_FILE="$REPO_ROOT/compose/docker-compose.yml"
+ENV_FILE="$REPO_ROOT/.env"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "fc: expected env file at $ENV_FILE but it was not found." >&2
+  echo "fc: copy .env.example to .env and fill in values." >&2
+  exit 1
+fi
+
+# --env-file must follow -f for finch compose's argument parser (v1.17).
+exec finch compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
