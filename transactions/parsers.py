@@ -1,9 +1,13 @@
 import abc
 import hashlib
+import io
 from datetime import datetime
+from decimal import Decimal
 import pdfplumber
 import re
-from .models import Transaction
+import ofxparse
+from ofxparse.ofxparse import AccountType as OfxAccountType
+from .models import Account, StatementImport, Transaction
 
 
 class StatementParser(abc.ABC):
@@ -333,3 +337,210 @@ class ChaseCreditPDFParser(StatementParser):
             )
         except (ValueError, TypeError, IndexError, AttributeError, KeyError) as e:
             self.stdout.write(self.style.ERROR(f"Skipping malformed transaction block: {data}. Description: {description_lines}. Error: {e}"))
+
+
+class ChaseCreditQFXParser(StatementParser):
+    """
+    Parses Chase credit card QFX statements.
+
+    QFX is the primary source of Chase credit card data. The parser keys
+    transactions on (account, FITID) for deduplication, and preserves any
+    foreign-currency enrichment already attached by the PDF parser.
+    """
+    parser_name = "chase_credit_qfx"
+
+    INSTITUTION_NAME = "Chase"
+    EXPECTED_FID = "10898"
+    EXPECTED_ORG = "B1"
+    EXPECTED_INTU_BID = "10898"
+
+    # Preserved on updates so PDF enrichment isn't clobbered by a QFX re-import.
+    FX_FIELDS = ('transaction_amount_minor', 'transaction_currency', 'exchange_rate')
+
+    def parse(self):
+        ofx = self._load_ofx()
+        self._verify_chase_signon(ofx)
+        account_obj, ccstmt = self._get_credit_card_statement(ofx)
+
+        account = self._get_or_create_account(account_obj, ccstmt)
+        import_record = self._create_statement_import(account, ccstmt)
+
+        created, updated = 0, 0
+        for txn in ccstmt.transactions:
+            if self._upsert_transaction(txn, account, import_record):
+                created += 1
+            else:
+                updated += 1
+
+        import_record.transaction_count = created + updated
+        import_record.save(update_fields=['transaction_count'])
+
+        self._log_success(
+            f"QFX parse complete for {account}: {created} created, {updated} updated."
+        )
+
+    # ---- helpers -----------------------------------------------------------
+
+    def _load_ofx(self):
+        """
+        Read the QFX file and hand it to ofxparse.
+
+        Chase QFX files seen in the wild have two quirks that break a naive
+        `ofxparse.OfxParser.parse(open(path, 'rb'))`:
+
+        1. A leading newline before the OFX header block, which makes
+           ofxparse's header parser stop before reading any headers and
+           fall back to ASCII decoding.
+        2. Stray bytes (often UTF-8 encoding of the replacement character
+           U+FFFD) embedded in <NAME> fields despite the file declaring
+           CHARSET:1252.
+
+        Pre-processing the raw bytes — strip leading whitespace, then
+        decode/re-encode as cp1252 with errors='replace' — fixes both in
+        one pass without patching ofxparse.
+        """
+        with open(self.statement_path, 'rb') as f:
+            raw = f.read()
+        cleaned = (
+            raw.lstrip()
+            .decode('cp1252', errors='replace')
+            .encode('cp1252', errors='replace')
+        )
+        return ofxparse.OfxParser.parse(io.BytesIO(cleaned))
+
+    def _verify_chase_signon(self, ofx):
+        """Raise if the file doesn't look like a Chase QFX."""
+        signon = ofx.signon
+        fid = getattr(signon, 'fi_fid', None) or ''
+        org = getattr(signon, 'fi_org', None) or ''
+        intu_bid = getattr(signon, 'intu_bid', None) or ''
+
+        if (
+            fid != self.EXPECTED_FID
+            or org != self.EXPECTED_ORG
+            or intu_bid != self.EXPECTED_INTU_BID
+        ):
+            raise ValueError(
+                "File does not look like a Chase QFX statement. "
+                f"Expected FID={self.EXPECTED_FID}, ORG={self.EXPECTED_ORG}, "
+                f"INTU.BID={self.EXPECTED_INTU_BID}; "
+                f"got FID={fid!r}, ORG={org!r}, INTU.BID={intu_bid!r}."
+            )
+
+    def _get_credit_card_statement(self, ofx):
+        """Find and return (account_obj, statement) for the credit-card account."""
+        if not ofx.accounts:
+            raise ValueError("QFX file contains no accounts.")
+
+        for account_obj in ofx.accounts:
+            if account_obj.type == OfxAccountType.CreditCard:
+                return account_obj, account_obj.statement
+
+        types_seen = sorted({a.type for a in ofx.accounts})
+        raise ValueError(
+            "QFX file contains no credit-card statement. "
+            f"Account types seen: {types_seen}. "
+            "This parser only handles credit-card QFX files; use a different "
+            "parser for bank/checking statements."
+        )
+
+    def _get_or_create_account(self, account_obj, ccstmt):
+        """Look up or create the Account this QFX file describes."""
+        currency = (ccstmt.currency or '').upper()
+        account, _ = Account.objects.get_or_create(
+            institution=self.INSTITUTION_NAME,
+            account_identifier=account_obj.account_id,
+            defaults={
+                'account_type': Account.AccountType.CREDIT_CARD,
+                'default_currency': currency,
+            },
+        )
+        return account
+
+    def _create_statement_import(self, account, ccstmt):
+        """Record a new StatementImport row for this parse run."""
+        return StatementImport.objects.create(
+            account=account,
+            source_file=self.statement_path,
+            parser_name=self.parser_name,
+            period_start=self._to_date(ccstmt.start_date),
+            period_end=self._to_date(ccstmt.end_date),
+            ledger_balance_minor=self._to_minor(ccstmt.balance),
+            available_balance_minor=self._to_minor(ccstmt.available_balance),
+        )
+
+    def _upsert_transaction(self, txn, account, import_record):
+        """
+        Create or update a Transaction keyed on (account, FITID).
+
+        Returns True if a row was created, False if an existing row was
+        updated. On update, FX fields and the ENRICHED status are preserved
+        so that a QFX re-import doesn't clobber PDF enrichment.
+        """
+        posted_date = self._to_date(txn.date)
+        settlement_minor = abs(self._to_minor(txn.amount))
+        trn_type = self._map_trn_type(txn.type)
+        description = txn.payee or ''
+
+        defaults = {
+            'posted_date': posted_date,
+            'description_raw': description,
+            'transaction_type': trn_type,
+            'settlement_amount_minor': settlement_minor,
+            'settlement_currency': account.default_currency,
+            'status': Transaction.Status.PARSED,
+            'statement_import': import_record,
+            'source_file': self.statement_path,
+        }
+
+        obj, created = Transaction.objects.get_or_create(
+            account=account,
+            source_transaction_id=txn.id,
+            defaults=defaults,
+        )
+
+        if created:
+            return True
+
+        # Update non-FX fields on an existing row. FX fields and ENRICHED
+        # status are intentionally preserved.
+        obj.posted_date = posted_date
+        obj.description_raw = description
+        obj.transaction_type = trn_type
+        obj.settlement_amount_minor = settlement_minor
+        obj.settlement_currency = account.default_currency
+        obj.statement_import = import_record
+        obj.source_file = self.statement_path
+        if obj.status != Transaction.Status.ENRICHED:
+            obj.status = Transaction.Status.PARSED
+        obj.save()
+        return False
+
+    @staticmethod
+    def _to_minor(amount):
+        """Convert a Decimal amount to an integer number of minor units."""
+        if amount is None:
+            return None
+        return int((Decimal(amount) * 100).to_integral_value(rounding='ROUND_HALF_UP'))
+
+    @staticmethod
+    def _to_date(dt):
+        """Return the date portion of a datetime, or None."""
+        if dt is None:
+            return None
+        if hasattr(dt, 'date'):
+            return dt.date()
+        return dt
+
+    @staticmethod
+    def _map_trn_type(raw_type):
+        """Map ofxparse's lowercase TRNTYPE string to the Transaction enum."""
+        if (raw_type or '').lower() == 'credit':
+            return Transaction.TransactionType.CREDIT
+        return Transaction.TransactionType.DEBIT
+
+    def _log_success(self, msg):
+        if self.stdout and self.style:
+            self.stdout.write(self.style.SUCCESS(msg))
+        elif self.stdout:
+            self.stdout.write(msg)
