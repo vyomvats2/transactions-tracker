@@ -3,3 +3,6 @@ djangorestframework
 psycopg2-binary
 pdfplumber
 debugpy
+ofxparse>=0.21
+pytest>=8.0
+pytest-django>=4.12
