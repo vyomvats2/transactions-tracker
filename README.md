@@ -80,7 +80,13 @@ The application is now running! You can access the Django admin interface to vie
 
 To parse a statement, you must place the file in a location accessible to the container. The project root is mounted as `/code/` inside the container. A good practice is to create a `statements/` directory in the project root to hold your files.
 
-Then, run the `parse_statement` management command, specifying which parser to use and the path to the file.
+Then, run the `parse_statement` management command, specifying which parser to use and the path to the file. Current parsers:
+
+*   `simple_pdf` — generic single-table PDF format.
+*   `chase_credit_pdf` — Chase credit card PDF statements. Used for FX enrichment of existing QFX-sourced transactions, not primary ingestion.
+*   `chase_credit_qfx` — Chase credit card QFX statements. The primary source for Chase transactions; uses FITID-based deduplication.
+
+For Chase credit card data, the workflow is two-pass: ingest the QFX file first (creates transactions with settlement amounts and stable bank-assigned IDs), then ingest the matching PDF to enrich each transaction with its original GBP amount and exchange rate.
 
 ```bash
 # Example: Create a directory for your statements
@@ -94,3 +100,39 @@ cp /path/to/your/bank-statement.pdf statements/
 ```
 
 The command will use the `simple_pdf` parser to process the file and save the transactions to the database. You can then view the imported data in the Django admin.
+
+### 6. Running Tests
+
+The test suite uses `pytest` + `pytest-django` and lives under `transactions/tests/`.
+
+Run the full suite:
+
+```bash
+./scripts/fc exec web pytest
+```
+
+Verbose output, one test per line:
+
+```bash
+./scripts/fc exec web pytest -v
+```
+
+Run a single module, class, or test:
+
+```bash
+./scripts/fc exec web pytest transactions/tests/test_qfx_parser.py
+./scripts/fc exec web pytest transactions/tests/test_qfx_parser.py::TestHappyPath
+./scripts/fc exec web pytest transactions/tests/test_qfx_parser.py::TestHappyPath::test_auto_creates_account
+```
+
+The suite reuses the same test database across runs for speed (`--reuse-db` is set in `pytest.ini`). If you change a migration, force a fresh DB:
+
+```bash
+./scripts/fc exec web pytest --create-db
+```
+
+Test fixtures live at `transactions/tests/fixtures/`:
+
+*   `chase_credit_sample.qfx` — anonymized Chase QFX file, used by the happy-path tests.
+*   `non_chase.qfx`, `bank_only.qfx` — hand-written rejection fixtures.
+*   `anonymize.py` — standalone script for generating a fresh anonymized fixture from a real Chase QFX. Run as `python transactions/tests/fixtures/anonymize.py <input> <output>`.
